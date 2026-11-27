@@ -1,8 +1,6 @@
-# scripts/run_scan.py v1.0
-# Ручной живой прогон сбора цен.
-# Аргумент = лимит категорий на магазин (для быстрого теста).
-# Пример: python scripts/run_scan.py 2   (быстро, 2 категории)
-#         python scripts/run_scan.py     (полный обход, долго)
+# scripts/run_scan.py v1.1
+# Ручной живой прогон. Использует готовые методы Fetcher.scan_store.
+# Аргумент = лимит магазинов (для быстрого теста), по умолчанию все active/expected.
 import sys, time
 from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
@@ -13,42 +11,37 @@ from collector.fetcher import Fetcher
 
 def main():
     init_schema()
-    cat_limit = int(sys.argv[1]) if len(sys.argv) > 1 else 0
+    store_limit = int(sys.argv[1]) if len(sys.argv) > 1 else 0
 
     conn = get_conn()
     rows = conn.execute(
-        "SELECT store_id FROM stores WHERE status IN ('active','expected')"
+        "SELECT store_id, address FROM stores WHERE status IN ('active','expected')"
     ).fetchall()
     conn.close()
-    ids = [r["store_id"] for r in rows]
-    if not ids:
+    stores = [(r["store_id"], r["address"]) for r in rows]
+    if not stores:
         print("[SCAN] Нет магазинов. Сначала: python scripts/seed_stores.py")
         return
-    print(f"[SCAN] Магазины: {ids}, лимит категорий: {cat_limit or 'все'}")
+    if store_limit:
+        stores = stores[:store_limit]
+    print(f"[SCAN] Магазинов: {len(stores)}")
 
     bm = BrowserManager()
     f = Fetcher(bm)
     t0 = time.time()
+    total_products = 0
     try:
-        for sid in ids:
-            cats = f.get_store_categories(sid)
-            if cat_limit:
-                cats = cats[:cat_limit]
-            total = 0
-            for cat in cats:
-                cid = str(cat.get("id") or "")
-                cname = str(cat.get("name") or "")
-                if not cid:
-                    continue
-                prods = f.get_category_products(sid, cid, cname)
-                for it in prods:
-                    f._process_product(sid, it, cname)
-                total += len(prods)
-                f._random_pause()
-            print(f"[SCAN] {sid}: {total} товаров")
+        for sid, addr in stores:
+            print(f"\n[SCAN] === {sid} | {addr} ===")
+            try:
+                count, ok = f.scan_store(sid)
+                total_products += count
+                print(f"[SCAN] {sid}: {count} товаров (ok={ok})")
+            except Exception as e:
+                print(f"[SCAN] Ошибка {sid}: {e}")
     finally:
         bm.stop()
-    print(f"[SCAN] Готово за {int(time.time() - t0)} сек")
+    print(f"\n[SCAN] Готово за {int(time.time()-t0)} сек, всего {total_products} товаров")
 
     conn = get_conn()
     top = conn.execute("""
@@ -59,7 +52,9 @@ def main():
         WHERE p.stock>0 AND p.regular>p.price
         ORDER BY p.discount_pct DESC LIMIT 10
     """).fetchall()
+    total = conn.execute("SELECT COUNT(*) AS c FROM prices").fetchone()["c"]
     conn.close()
+    print(f"\n[БАЗА] Всего записей цен: {total}")
     print("[TOP-10 скидок в базе]")
     for r in top:
         print(
