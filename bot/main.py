@@ -1,5 +1,5 @@
-# bot/main.py v1.0
-# Точка входа бота. Токен берётся из .env / окружения, НЕ из кода.
+# bot/main.py v1.2
+# Точка входа бота + фоновая рассылка скидок.
 
 import os
 import asyncio
@@ -10,11 +10,11 @@ from aiogram import Bot, Dispatcher
 from aiogram.client.default import DefaultBotProperties
 from aiogram.enums import ParseMode
 
-from bot.handlers import start
+from bot.handlers import start, user
+from bot.sender import sender_loop
 
 
 def load_env() -> None:
-    """Простой загрузчик .env без внешних зависимостей."""
     p = Path(__file__).resolve().parent.parent / ".env"
     if p.exists():
         for line in p.read_text(encoding="utf-8").splitlines():
@@ -29,15 +29,20 @@ async def main() -> None:
     load_env()
     token = os.getenv("BOT_TOKEN")
     if not token:
-        raise SystemExit("❌ BOT_TOKEN не задан. Создай .env на сервере.")
+        raise SystemExit("❌ BOT_TOKEN не задан.")
 
     logging.basicConfig(level=logging.INFO)
     bot = Bot(token, default=DefaultBotProperties(parse_mode=ParseMode.HTML))
     dp = Dispatcher()
     dp.include_router(start.router)
+    dp.include_router(user.router)
 
     await bot.delete_webhook(drop_pending_updates=True)
     logging.info("🤖 Бот запущен, polling...")
+
+    # Запускаем рассылку как фоновую задачу
+    asyncio.create_task(sender_loop(bot))
+
     await dp.start_polling(bot)
 
 
