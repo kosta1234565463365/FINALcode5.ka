@@ -1,0 +1,17 @@
+[Unit]
+Description=5ka-bot - Telegram-бот мониторинга скидок Пятёрочки
+After=network.target 5ka-collector.service
+
+[Service]
+Type=simple
+User=root
+WorkingDirectory=/opt/5ka_bot
+Environment=PYTHONPATH=/opt/5ka_bot
+ExecStart=/opt/5ka_bot/venv/bin/python -m bot.main
+Restart=always
+RestartSec=10
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target
