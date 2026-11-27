@@ -1,24 +1,31 @@
-# bot/handlers/start.py v1.0
+# bot/handlers/start.py v1.1
 # /start: регистрация, определение роли, показ меню.
+# Приоритет роли: staff (назначенная персонально) > users.role (базовая).
 
 from aiogram import Router, F
 from aiogram.types import Message, CallbackQuery
 from aiogram.filters import CommandStart
 
-from core.db import upsert_user, get_conn
+from core.db import upsert_user, get_conn, get_user
 from bot import keyboards as kb
 
 router = Router()
 
 
 def get_role(user_id: int) -> str:
-    """Роль из staff (если активен), иначе обычный user."""
+    """Сначала смотрим staff (активная персональная роль).
+    Если нет — берём users.role. Если и там пусто — 'user'."""
     conn = get_conn()
     row = conn.execute(
         "SELECT role FROM staff WHERE user_id=? AND is_active=1", (user_id,)
     ).fetchone()
     conn.close()
-    return row["role"] if row else "user"
+    if row:
+        return row["role"]
+    u = get_user(user_id)
+    if u and u["role"] and u["role"] != "user":
+        return u["role"]
+    return "user"
 
 
 def menu_for_role(role: str):
