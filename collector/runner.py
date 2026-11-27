@@ -1,4 +1,4 @@
-# collector/runner.py v1.0
+# collector/runner.py v1.1
 # Главный цикл коллектора: волны через scheduler, режимы через fetcher.
 # Волна 1 (07:00) = полный проход всех активных магазинов.
 # Волна 2 (08:00) = точечная проверка только скидочных PLU из 07:00 + вчера.
@@ -21,7 +21,6 @@ from collector.scheduler import (
     get_next_wave,
     mark_wave_executed,
 )
-from collector.watchdog import Watchdog
 
 logging.basicConfig(
     level=logging.INFO,
@@ -94,7 +93,8 @@ def full_pass(fetcher: Fetcher) -> None:
 
 
 def pointcheck_pass(fetcher: Fetcher) -> None:
-    """Точечная проверка 08:00 — только скидочные PLU."""
+    """Точечная проверка 08:00 — только скидочные PLU.
+    Использует расширенную статистику fetcher.check_specific_plu (v2.1)."""
     by_store = get_pointcheck_plu()
     if not by_store:
         logger.info("[Runner] 08:00: нет скидочных PLU для точечной проверки")
@@ -105,8 +105,13 @@ def pointcheck_pass(fetcher: Fetcher) -> None:
     )
     for sid, plu_list in by_store.items():
         try:
-            updated = fetcher.check_specific_plu(sid, plu_list)
-            logger.info(f"[Runner] {sid}: обновлено {updated}/{len(plu_list)} PLU")
+            stats = fetcher.check_specific_plu(sid, plu_list)
+            logger.info(
+                f"[Runner] {sid}: найдено {stats['found_in_catalog']}/{stats['total']}, "
+                f"обновлено со скидкой {stats['updated_with_discount']}, "
+                f"без скидки {stats['skipped_no_discount']}, "
+                f"пропало {stats['missing_in_catalog']}"
+            )
         except Exception as e:
             logger.error(f"[Runner] Ошибка {sid}: {e}")
 
@@ -165,13 +170,10 @@ def main() -> None:
             try:
                 bm.ensure_ready()
                 if wnum == 1:
-                    # 07:00 — полный проход
                     full_pass(f)
                 elif wnum == 2:
-                    # 08:00 — точечный проход по скидкам
                     pointcheck_pass(f)
                 else:
-                    # остальные волны — полный проход
                     full_pass(f)
             except Exception as e:
                 logger.error(f"[Runner] Ошибка волны {wnum}: {e}")
