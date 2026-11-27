@@ -1,16 +1,14 @@
-# collector/fetcher.py v2.0
-# Поддержка полного (07:00) и точечного (08:00) прохода.
+# collector/fetcher.py v2.1 — с расширенным логированием точечного прохода
 import json, time, random, logging
 from typing import List, Dict, Optional, Tuple, Any
 
-from core.db import get_conn, record_price, set_store_status
+from core.db import get_conn, record_price
 from collector.browser import BrowserManager
 
 logger = logging.getLogger(__name__)
 HOST = "https://5d." + "5ka.ru"
 SITE = "https://" + "5ka.ru/"
 
-# Настройки пагинации (после совета коллеги)
 PAGE_LIMIT = 100
 MIN_PAUSE = 1.5
 MAX_PAUSE = 2.5
@@ -49,7 +47,7 @@ class Fetcher:
         time.sleep(random.uniform(MIN_PAUSE, MAX_PAUSE))
         self.browser.increment_request()
 
-    # === ПОЛНЫЙ ПРОХОД (07:00) ===
+    # === ПОЛНЫЙ ПРОХОД ===
 
     def get_categories(self, store_id: str) -> List[Dict]:
         url = f"{HOST}/api/catalog/v2/stores/{store_id}/categories?mode=store&include_restrict=true"
@@ -60,7 +58,6 @@ class Fetcher:
         return data if isinstance(data, list) else []
 
     def get_products(self, store_id: str, cat_id: str) -> List[Dict]:
-        """Пагинация по limit=100 с динамическим шагом (совет коллеги)."""
         all_prods = []
         offset = 0
         while True:
@@ -96,7 +93,6 @@ class Fetcher:
         return str(item.get("image_url") or "")
 
     def get_baseline(self, store_id: str, plu: str, cur_reg: float) -> Tuple[float, str]:
-        """Честная регулярная цена: 7 дней стабильности ±3% или 80-й перцентиль за 21 день."""
         from datetime import datetime, timezone, timedelta
         MSK = timezone(timedelta(hours=3))
         now = int(datetime.now(MSK).timestamp())
@@ -122,33 +118,26 @@ class Fetcher:
         prices = sorted([r["regular"] for r in rows] + ([cur_reg] if cur_reg > 0 else []))
         return round(prices[int(0.8 * (len(prices) - 1))], 2), "p80_21d"
 
-    def _is_hidden_crash(self, baseline: float, cur_reg: float) -> bool:
-        """Если текущая 'регулярная' выше базы на >15% — магазин пытается накрутить."""
-        if baseline <= 0:
-            return False
-        return cur_reg > baseline * 1.15
-
-    def _process(self, store_id: str, item: Dict, cat_name: str) -> None:
+    def _process(self, store_id: str, item: Dict, cat_name: str) -> bool:
+        """Возвращает True, если товар записан (есть скидка), False — если пропущен."""
         plu = str(item.get("plu") or item.get("id") or "")
         if not plu:
-            return
+            return False
         name = str(item.get("name") or "")
         prices = item.get("prices") or {}
         reg = float(prices.get("regular") or prices.get("price") or 0)
         price = float(prices.get("discount") or prices.get("price") or reg)
         stock = float(item.get("stock_limit") or item.get("stock") or 0)
         if stock <= 0 or price >= reg or reg <= 0:
-            return
+            return False
         baseline, method = self.get_baseline(store_id, plu, reg)
-        if self._is_hidden_crash(baseline, reg):
-            logger.info(f"[Fetcher] {plu}: скрытое завышение {reg} vs base {baseline}")
-            baseline = reg  # не блокируем, но фиксируем
         record_price(
             store_id=store_id, plu=plu, name=name,
             regular=baseline, price=price, stock=stock, source="api",
             category_name=cat_name, img_url=self._img(item),
             promo_type=str(item.get("promo_type") or ""),
         )
+        return True
 
     def scan_store(self, store_id: str) -> Tuple[int, bool]:
         cats = self.get_categories(store_id)
@@ -169,18 +158,29 @@ class Fetcher:
 
     # === ТОЧЕЧНЫЙ ПРОХОД (08:00) ===
 
-    def check_specific_plu(self, store_id: str, plu_list: List[str]) -> int:
-        """Проверяет только конкретные PLU: по 1 микро-запросу на позицию.
-        Для каждого PLU запрашиваем все категории магазина и ищем совпадение.
-        Возвращает количество обновлённых позиций.
+    def check_specific_plu(self, store_id: str, plu_list: List[str]) -> Dict[str, int]:
+        """Проверяет конкретные PLU. Возвращает словарь со статистикой:
+        - found_in_catalog: найдено в каталоге магазина
+        - updated_with_discount: обновлено со скидкой
+        - skipped_no_discount: найдено, но скидки больше нет
+        - missing_in_catalog: не найдено в каталоге
         """
+        stats = {
+            "total": len(plu_list),
+            "found_in_catalog": 0,
+            "updated_with_discount": 0,
+            "skipped_no_discount": 0,
+            "missing_in_catalog": 0,
+        }
         if not plu_list:
-            return 0
+            return stats
+
         cats = self.get_categories(store_id)
         if not cats:
-            return 0
+            stats["missing_in_catalog"] = len(plu_list)
+            return stats
+
         plu_set = set(plu_list)
-        updated = 0
         for c in cats:
             if not plu_set:
                 break
@@ -193,12 +193,17 @@ class Fetcher:
             for it in prods:
                 plu = str(it.get("plu") or "")
                 if plu in plu_set:
-                    self._process(store_id, it, cname)
                     found_in_cat.append(plu)
-                    updated += 1
+                    stats["found_in_catalog"] += 1
+                    if self._process(store_id, it, cname):
+                        stats["updated_with_discount"] += 1
+                    else:
+                        stats["skipped_no_discount"] += 1
             plu_set -= set(found_in_cat)
             self._pause()
-        return updated
+
+        stats["missing_in_catalog"] = len(plu_set)
+        return stats
 
     def run_cycle(self, store_ids: List[str]) -> Dict[str, int]:
         results = {}
