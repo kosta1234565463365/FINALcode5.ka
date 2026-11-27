@@ -1,96 +1,98 @@
-
-# bot/sender.py v1.0
-# Фоновая рассылка скидок подписчикам.
-# Работает как asyncio-задача внутри бота. Проверяет БД каждую минуту.
-
-import asyncio
-import logging
-import time
-from datetime import datetime, timezone, timedelta
+# bot/sender.py v1.0 — рассылка скидок подписчикам
+import asyncio, time, logging
 from aiogram import Bot
-from aiogram.exceptions import TelegramRetryAfter
-from core.db import get_conn
+from core.db import get_conn, now_ts
 
 logger = logging.getLogger(__name__)
-MSK = timezone(timedelta(hours=3))
 
+def ensure_sender_tables():
+    c = get_conn()
+    c.execute("""CREATE TABLE IF NOT EXISTS notifications (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        user_id INTEGER NOT NULL, store_id TEXT, plu TEXT, name TEXT,
+        regular REAL, price REAL, pct INTEGER, stock REAL,
+        img_url TEXT DEFAULT '', sent INTEGER DEFAULT 0, ts INTEGER NOT NULL)""")
+    c.execute("""CREATE TABLE IF NOT EXISTS active_alerts (
+        user_id INTEGER, store_id TEXT, plu TEXT, PRIMARY KEY(user_id, store_id, plu))""")
+    c.commit(); c.close()
 
-def init_sender_schema():
-    """Добавляем поле last_notify_ts в users, если его нет."""
-    conn = get_conn()
-    try:
-        conn.execute("ALTER TABLE users ADD COLUMN last_notify_ts INTEGER DEFAULT 0")
-        conn.commit()
-    except Exception:
-        pass  # Колонка уже есть
-    conn.close()
+def generate_notifications():
+    """После каждого прохода парсера: найти новые скидки, отфильтровать по пользователям."""
+    c = get_conn()
+    cutoff = now_ts() - 40*60
+    new_discounts = c.execute("""
+        SELECT p.store_id, p.plu, pr.name, p.regular, p.price, p.discount_pct, p.stock, pr.img_url, s.address
+        FROM prices p
+        JOIN products pr ON pr.plu=p.plu
+        JOIN stores s ON s.store_id=p.store_id
+        WHERE p.ts >= ? AND p.discount_pct >= 25 AND p.stock > 0
+    """, (cutoff,)).fetchall()
+    
+    users = c.execute("SELECT user_id, threshold_pct FROM users WHERE role='user'").fetchall()
+    stores_by_user = {}
+    for u in users:
+        rows = c.execute("SELECT store_id FROM user_stores WHERE user_id=?", (u["user_id"],)).fetchall()
+        stores_by_user[u["user_id"]] = {r["store_id"] for r in rows}
+    
+    added = 0
+    for d in new_discounts:
+        pct = int(d["discount_pct"])
+        for u in users:
+            if pct < u["threshold_pct"]:
+                continue
+            user_stores = stores_by_user.get(u["user_id"], set())
+            if user_stores and d["store_id"] not in user_stores:
+                continue
+            exists = c.execute("SELECT 1 FROM active_alerts WHERE user_id=? AND store_id=? AND plu=?",
+                               (u["user_id"], d["store_id"], d["plu"])).fetchone()
+            if exists:
+                continue
+            c.execute("INSERT INTO notifications (user_id,store_id,plu,name,regular,price,pct,stock,img_url,ts) VALUES(?,?,?,?,?,?,?,?,?,?)",
+                      (u["user_id"], d["store_id"], d["plu"], d["name"], d["regular"], d["price"], pct, d["stock"], d["img_url"], now_ts()))
+            c.execute("INSERT OR IGNORE INTO active_alerts (user_id,store_id,plu) VALUES(?,?,?)",
+                      (u["user_id"], d["store_id"], d["plu"]))
+            added += 1
+    c.commit(); c.close()
+    return added
 
-
-def format_discount_card(row: dict) -> str:
-    stock_warn = " ⚠️ <i>Мало!</i>" if row["stock"] <= 2 else ""
-    return (
-        f"🔥 <b>{row['name']}</b>\n"
-        f"💰 <b>{row['price']:.0f} ₽</b> (было {row['regular']:.0f} ₽)\n"
-        f"📉 Скидка: <b>-{row['discount_pct']:.0f}%</b>\n"
-        f"🏬 {row['address']}\n"
-        f"📦 Остаток: {row['stock']:.0f} шт.{stock_warn}"
-    )
-
-
-async def send_safe(bot: Bot, user_id: int, text: str):
-    """Отправка с защитой от 429 Too Many Requests."""
-    try:
-        await bot.send_message(user_id, text, parse_mode="HTML")
-        await asyncio.sleep(0.06)  # Микропауза против флуд-бана
-    except TelegramRetryAfter as e:
-        logger.warning(f"Rate limit для {user_id}: ждём {e.retry_after}с")
-        await asyncio.sleep(e.retry_after)
-        await bot.send_message(user_id, text, parse_mode="HTML")
-    except Exception as e:
-        logger.error(f"Не удалось отправить {user_id}: {e}")
-
+async def send_pending(bot: Bot, limit=50):
+    c = get_conn()
+    rows = c.execute("SELECT * FROM notifications WHERE sent=0 ORDER BY id LIMIT ?", (limit,)).fetchall()
+    c.close()
+    for r in rows:
+        stock_warn = " ⚠️ Остаток мал!" if r["stock"] <= 2 else ""
+        text = (
+            f"🔥 <b>-{r['pct']}%</b>\n"
+            f"<b>{r['name']}</b>\n"
+            f"💰 {r['price']:.0f}₽ (было {r['regular']:.0f}₽)\n"
+            f"📦 Остаток: {r['stock']:.0f} шт{stock_warn}\n"
+            f"🏪 Магазин: {r['store_id']}"
+        )
+        try:
+            if r["img_url"]:
+                await bot.send_photo(r["user_id"], r["img_url"], caption=text, parse_mode="HTML")
+            else:
+                await bot.send_message(r["user_id"], text, parse_mode="HTML")
+            c = get_conn()
+            c.execute("UPDATE notifications SET sent=1 WHERE id=?", (r["id"],))
+            c.commit(); c.close()
+            await asyncio.sleep(0.06)
+        except Exception as e:
+            logger.warning(f"[Sender] ошибка отправки {r['id']}: {e}")
+            c = get_conn()
+            c.execute("UPDATE notifications SET sent=1 WHERE id=?", (r["id"],))
+            c.commit(); c.close()
 
 async def sender_loop(bot: Bot):
-    """Основной цикл: ищет новые скидки и шлёт их."""
-    init_sender_schema()
-    logger.info("[Sender] Цикл рассылки запущен")
-
+    """Фоновая задача: раз в 60 сек генерировать и отправлять уведомления."""
+    ensure_sender_tables()
+    logger.info("[Sender] цикл запущен")
     while True:
         try:
-            conn = get_conn()
-            # Берём активных пользователей (role='user', порог < 100%)
-            users = conn.execute(
-                "SELECT user_id, threshold_pct, last_notify_ts "
-                "FROM users WHERE role='user' AND threshold_pct < 100"
-            ).fetchall()
-
-            for u in users:
-                last_ts = u["last_notify_ts"] or 0
-                # Ищем новые скидки для этого пользователя
-                # В реальной версии здесь будет JOIN с user_stores и фильтр категорий
-                rows = conn.execute("""
-                    SELECT p.plu, pr.name, p.price, p.regular, p.discount_pct, p.stock, s.address
-                    FROM prices p
-                    JOIN products pr ON pr.plu = p.plu
-                    JOIN stores s ON s.store_id = p.store_id
-                    WHERE p.ts > ? AND p.discount_pct >= ? AND p.stock > 0
-                    ORDER BY p.discount_pct DESC LIMIT 5
-                """, (last_ts, u["threshold_pct"])).fetchall()
-
-                if rows:
-                    logger.info(f"[Sender] Найдено {len(rows)} скидок для {u['user_id']}")
-                    for r in rows:
-                        await send_safe(bot, u["user_id"], format_discount_card(dict(r)))
-                    # Обновляем время последней отправки
-                    now_ts = int(datetime.now(MSK).timestamp())
-                    conn.execute(
-                        "UPDATE users SET last_notify_ts = ? WHERE user_id = ?",
-                        (now_ts, u["user_id"])
-                    )
-                    conn.commit()
-
-            conn.close()
+            added = generate_notifications()
+            if added:
+                logger.info(f"[Sender] сгенерировано {added} уведомлений")
+            await send_pending(bot)
         except Exception as e:
-            logger.error(f"[Sender] Ошибка цикла: {e}")
-
-        await asyncio.sleep(60)  # Проверка раз в минуту
+            logger.error(f"[Sender] ошибка цикла: {e}")
+        await asyncio.sleep(60)
